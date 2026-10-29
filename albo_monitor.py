@@ -155,10 +155,32 @@ def run():
                priority=2, tags="white_check_mark")
     st["fails"], st["fail_alerted"] = 0, False
 
+    # Il Comune pubblica lo stesso atto in più record (stesso numero di registro,
+    # ID diversi: es. albo 15 gg + trasparenza fino al 2031). Si deduplica per
+    # numero di registro, mantenendo la compatibilità con gli ID già salvati.
+    # Regola: tra i record con lo stesso numero si tiene quello con la data di
+    # fine pubblicazione più vicina (albo pretorio, max 15 gg) e si scartano gli
+    # altri (es. trasparenza fino al 31/12/2031).
+    def fine(it):
+        d = re.findall(r"(\d{2})/(\d{2})/(\d{4})", it["periodo"])
+        return (d[-1][2], d[-1][1], d[-1][0]) if d else ("9999",)
+
     seen = set(st["seen"])
-    new = [it for it in items if it["id"] not in seen]
+    best = {}
+    for it in reversed(items):  # dal più vecchio al più nuovo
+        key = it["numero"] or it["id"]
+        if key not in best or fine(it) < fine(best[key]):
+            best[key] = it
+    new = []
+    for it in reversed(items):
+        key = it["numero"] or it["id"]
+        if it["id"] in seen or key in seen or best[key] is not it:
+            if it["id"] not in seen:
+                st["seen"].append(it["id"])  # scartato: lo segno come visto
+            continue
+        new.append(it)
     hits = 0
-    for it in reversed(new):  # dal più vecchio al più nuovo
+    for it in new:
         text = " ".join([it["categoria"], it["oggetto"]])
         detail = {}
         try:
@@ -176,7 +198,7 @@ def run():
             body += f"\nPubblicazione: {it['periodo'].replace(' ', ' → ', 1)}"
             notify(f"Albo Marsala {it['numero']} · {', '.join(kws)}", body,
                    click=PUBLIC_URL.format(id=it["id"]))
-        st["seen"].append(it["id"])
+        st["seen"] += [it["id"], it["numero"] or it["id"]]
 
     save_state(st)
     print(f"OK: {len(items)} lette, {len(new)} nuove, {hits} con parole chiave"
