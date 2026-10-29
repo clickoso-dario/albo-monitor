@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""
+Monitor Albo Pretorio - Comune di Marsala
+Controlla le ultime pubblicazioni e invia una notifica push (ntfy) quando
+oggetto, proponente o titoli degli allegati contengono una delle parole chiave.
+
+Solo libreria standard Python 3.8+. Configurazione via variabili d'ambiente:
+  NTFY_TOPIC   (obbligatoria) nome del canale ntfy, es. "clickoso-albo-x7k2p9"
+  NTFY_SERVER  (opzionale)   default https://ntfy.sh
+  NTFY_TOKEN   (opzionale)   token se usi un server ntfy protetto
+  STATE_FILE   (opzionale)   default ./state.json
+  PAGE_SIZE    (opzionale)   righe lette per giro, default 100
+  DRY_RUN=1    (opzionale)   stampa le notifiche invece di inviarle
+"""
+import html
+import json
+import os
+import re
+import sys
+import time
+import unicodedata
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+BASE = "https://marsala.trasparenza-valutazione-merito.it"
+LIST_URL = (
+    BASE + "/web/trasparenza/papca-ap?p_p_id=jcitygovalbopubblicazioni_WAR_jcitygovalbiportlet"
+    "&p_p_lifecycle=1&p_p_state=pop_up&p_p_mode=view"
+    "&_jcitygovalbopubblicazioni_WAR_jcitygovalbiportlet_action=eseguiPaginazione"
+)
+DETAIL_URL = BASE + "/web/trasparenza/papca-ap/-/papca/display/{id}?p_p_state=pop_up"
+PUBLIC_URL = BASE + "/web/trasparenza/papca-ap/-/papca/display/{id}"
+
+# Parole chiave: testo normalizzato (maiuscolo, senza accenti), confini di parola
+# per evitare falsi positivi (es. "PIP" dentro altre parole).
+KEYWORDS = {
+    "Clickoso": r"\bCLICKOSO\b",
+    "SUAP": r"\bS\.?\s?U\.?\s?A\.?\s?P\b",
+    "Amabilina": r"\bAMABILINA\b",
+    "PIP": r"\bP\.?\s?I\.?\s?P\b",
+    "Piano per Insediamenti Produttivi": r"\bPIANO\s+(?:PER\s+)?(?:GLI\s+)?INSEDIAMENTI\s+PRODUTTIVI\b",
+}
+KW_RE = {k: re.compile(v) for k, v in KEYWORDS.items()}
+
+STATE_FILE = Path(os.environ.get("STATE_FILE", Path(__file__).with_name("state.json")))
+PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "100"))
+FAIL_ALERT_AFTER = 6          # 6 giri falliti di fila (~1 ora) -> avviso
+SEEN_KEEP = 3000              # quanti ID ricordare
+UA = "Mozilla/5.0 (compatible; AlboMonitor/1.0; +clickoso.it)"
+
+
+def http(url, data=None, headers=None, timeout=30):
+    body = urllib.parse.urlencode(data).encode() if isinstance(data, dict) else data
+    req = urllib.request.Request(url, data=body, headers={"User-Agent": UA, **(headers or {})})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", errors="replace")
+
+
+def clean(s):
+    s = re.sub(r"<br\s*/?>", " ", s, flags=re.I)
+    s = re.sub(r"<[^>]+>", " ", s)
+    return re.sub(r"\s+", " ", html.unescape(s)).strip()
+
+
+def norm(s):
+    s = unicodedata.normalize("NFKD", s)
+    return "".join(c for c in s if not unicodedata.combining(c)).upper()
+
+
+def parse_list(page):
+    """Estrae le righe della lista: id, numero, categoria, oggetto, periodo."""
+    items = []
+    for m in re.finditer(r'<tr[^>]*\bdata-id="(\d+)"[^>]*>(.*?)</tr>', page, re.S):
+        rid, row = m.group(1), m.group(2)
+        cell = lambda cls: clean((re.search(
+            r'<td[^>]*class="[^"]*\b' + cls + r'\b[^"]*"[^>]*>(.*?)</td>', row, re.S) or [None, ""])[1])
+        items.append({
+            "id": rid,
+            "numero": cell("annonumeroregistrazione"),
+            "categoria": cell("categoria"),
+            "oggetto": cell("oggetto"),
+            "periodo": cell("periodo-pubblicazione"),
+        })
+    return items
+
+
+def parse_detail(page):
+    """Testo utile del dettaglio: proponente, oggetto, allegati, ecc."""
+    fields = {}
+    for m in re.finditer(r'<tr class="ap-([\w-]+)">(.*?)</tr>', page, re.S):
+        tds = re.findall(r"<td[^>]*>(.*?)</td>", m.group(2), re.S)
+        if len(tds) >= 2:
+            fields[m.group(1)] = clean(tds[1])
+    start, end = page.find("Dettaglio Atto"), page.find("Contenuto inserito")
+    fields["_testo"] = clean(page[start:end]) if start >= 0 and end > start else ""
+    return fields
+
+
+def find_keywords(text):
+    t = norm(text)
+    return [k for k, rx in KW_RE.items() if rx.search(t)]
+
+
+def notify(title, message, click=None, priority=5, tags="rotating_light"):
+    if os.environ.get("DRY_RUN") == "1":
+        print(f"[DRY_RUN] {title}\n{message}\n{click}\n")
+        return
+    topic = os.environ["NTFY_TOPIC"]
+    server = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+    payload = {"topic": topic, "title": title, "message": message,
+               "priority": priority, "tags": tags.split(",")}
+    if click:
+        payload["click"] = click
+        payload["actions"] = [{"action": "view", "label": "Apri atto", "url": click}]
+    headers = {"Content-Type": "application/json"}
+    if os.environ.get("NTFY_TOKEN"):
+        headers["Authorization"] = "Bearer " + os.environ["NTFY_TOKEN"]
+    http(server, data=json.dumps(payload).encode(), headers=headers, timeout=20)
+
+
+def load_state():
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {"seen": [], "fails": 0, "fail_alerted": False}
+
+
+def save_state(st):
+    st["seen"] = st["seen"][-SEEN_KEEP:]
+    STATE_FILE.write_text(json.dumps(st, ensure_ascii=False, indent=1))
+
+
+def run():
+    st = load_state()
+    first_run = not st["seen"]
+    try:
+        page = http(LIST_URL, {"hidden_page_size": str(PAGE_SIZE), "hidden_page_to": "1"})
+        items = parse_list(page)
+        if not items:
+            raise RuntimeError("lista vuota: struttura della pagina cambiata?")
+    except Exception as e:
+        st["fails"] = st.get("fails", 0) + 1
+        print(f"ERRORE lettura albo ({st['fails']} di fila): {e}", file=sys.stderr)
+        if st["fails"] >= FAIL_ALERT_AFTER and not st.get("fail_alerted"):
+            notify("Monitor Albo Marsala: non riesco a leggere l'albo",
+                   f"{st['fails']} tentativi falliti di fila. Ultimo errore: {e}",
+                   priority=3, tags="warning")
+            st["fail_alerted"] = True
+        save_state(st)
+        return 1
+
+    if st.get("fail_alerted"):
+        notify("Monitor Albo Marsala: di nuovo operativo", "La lettura dell'albo funziona di nuovo.",
+               priority=2, tags="white_check_mark")
+    st["fails"], st["fail_alerted"] = 0, False
+
+    # Il Comune pubblica lo stesso atto in più record (stesso numero di registro,
+    # ID diversi: es. albo 15 gg + trasparenza fino al 2031). Si deduplica per
+    # numero di registro, mantenendo la compatibilità con gli ID già salvati.
+    # Regola: tra i record con lo stesso numero si tiene quello con la data di
+    # fine pubblicazione più vicina (albo pretorio, max 15 gg) e si scartano gli
+    # altri (es. trasparenza fino al 31/12/2031).
+    def fine(it):
+        d = re.findall(r"(\d{2})/(\d{2})/(\d{4})", it["periodo"])
+        return (d[-1][2], d[-1][1], d[-1][0]) if d else ("9999",)
+
+    seen = set(st["seen"])
+    best = {}
+    for it in reversed(items):  # dal più vecchio al più nuovo
+        key = it["numero"] or it["id"]
+        if key not in best or fine(it) < fine(best[key]):
+            best[key] = it
+    new = []
+    for it in reversed(items):
+        key = it["numero"] or it["id"]
+        if it["id"] in seen or key in seen or best[key] is not it:
+            if it["id"] not in seen:
+                st["seen"].append(it["id"])  # scartato: lo segno come visto
+            continue
+        new.append(it)
+    hits = 0
+    for it in new:
+        text = " ".join([it["categoria"], it["oggetto"]])
+        detail = {}
+        try:
+            detail = parse_detail(http(DETAIL_URL.format(id=it["id"])))
+            text += " " + detail.get("_testo", "")
+            time.sleep(0.5)  # gentilezza verso il server del Comune
+        except Exception as e:
+            print(f"dettaglio {it['id']} non letto: {e}", file=sys.stderr)
+        kws = find_keywords(text)
+        if kws:
+            hits += 1
+            body = it["oggetto"][:400]
+            if detail.get("proponente"):
+                body += f"\n\nProponente: {detail['proponente']}"
+            body += f"\nPubblicazione: {it['periodo'].replace(' ', ' → ', 1)}"
+            notify(f"Albo Marsala {it['numero']} · {', '.join(kws)}", body,
+                   click=PUBLIC_URL.format(id=it["id"]))
+        st["seen"] += [it["id"], it["numero"] or it["id"]]
+
+    save_state(st)
+    print(f"OK: {len(items)} lette, {len(new)} nuove, {hits} con parole chiave"
+          + (" (primo avvio)" if first_run else ""))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run())
